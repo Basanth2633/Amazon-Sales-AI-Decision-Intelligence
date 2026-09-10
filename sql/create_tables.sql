@@ -1,0 +1,94 @@
+CREATE TABLE IF NOT EXISTS stg_amazon_sales (
+    order_id BIGINT,
+    order_date DATE,
+    product_id BIGINT,
+    product_category VARCHAR(100),
+    price DECIMAL(12,2),
+    discount_percent DECIMAL(5,2),
+    quantity_sold INT,
+    customer_region VARCHAR(100),
+    payment_method VARCHAR(50),
+    rating DECIMAL(3,1),
+    review_count INT,
+    discounted_price DECIMAL(12,2),
+    total_revenue DECIMAL(14,2),
+    profit DECIMAL(14,2),
+    order_year INT,
+    order_month INT,
+    month_name VARCHAR(20),
+    order_quarter INT,
+    weekday_name VARCHAR(20),
+    discount_group VARCHAR(30),
+    profit_margin_percent DECIMAL(10,2),
+    loaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+
+CREATE TABLE IF NOT EXISTS fact_amazon_sales (
+    order_id BIGINT PRIMARY KEY,
+    order_date DATE NOT NULL,
+    product_id BIGINT NOT NULL,
+    product_category VARCHAR(100),
+    price DECIMAL(12,2),
+    discount_percent DECIMAL(5,2),
+    quantity_sold INT,
+    customer_region VARCHAR(100),
+    payment_method VARCHAR(50),
+    rating DECIMAL(3,1),
+    review_count INT,
+    discounted_price DECIMAL(12,2),
+    total_revenue DECIMAL(14,2),
+    profit DECIMAL(14,2),
+    order_year INT,
+    order_month INT,
+    month_name VARCHAR(20),
+    order_quarter INT,
+    weekday_name VARCHAR(20),
+    discount_group VARCHAR(30),
+    profit_margin_percent DECIMAL(10,2),
+    loaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+
+CREATE TABLE IF NOT EXISTS ai_sales_insights (
+    insight_id INT AUTO_INCREMENT PRIMARY KEY,
+
+    generated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    analysis_start_date DATE,
+    analysis_end_date DATE,
+
+    total_orders INT,
+    total_revenue DECIMAL(18,2),
+    total_profit DECIMAL(18,2),
+    total_units_sold INT,
+    average_rating DECIMAL(5,2),
+
+    executive_summary TEXT,
+
+    key_findings JSON,
+
+    trend_analysis TEXT,
+
+    category_insights JSON,
+
+    regional_insights JSON,
+
+    discount_insights JSON,
+
+    customer_feedback_insights JSON,
+
+    anomaly_explanations JSON,
+
+    risks JSON,
+
+    opportunities JSON,
+
+    recommendations JSON,
+
+    follow_up_questions JSON,
+
+    model_name VARCHAR(100),
+
+    airflow_run_id VARCHAR(255)
+);
