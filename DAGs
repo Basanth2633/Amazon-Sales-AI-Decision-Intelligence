@@ -1,0 +1,1525 @@
+from pathlib import Path
+
+import pendulum
+from airflow.sdk import dag, task
+from airflow.decorators import task
+from airflow.providers.mysql.hooks.mysql import MySqlHook
+from airflow.operators.python import get_current_context
+
+from openai import OpenAI
+import json
+
+CSV_PATH = Path("/opt/airflow/data/raw/amazon_sales.csv")
+
+
+@dag(
+    dag_id="amazon_sales_etl_pipeline",
+    description="ETL pipeline for the Amazon Sales Analytics project",
+    schedule=None,
+    start_date=pendulum.datetime(2026, 1, 1, tz="UTC"),
+    catchup=False,
+    tags=["amazon", "sales", "etl"],
+)
+def amazon_sales_etl_pipeline():
+
+    @task
+    def check_source_file() -> dict:
+        """
+        Confirm that the source CSV exists and is not empty.
+        """
+
+        if not CSV_PATH.exists():
+            raise FileNotFoundError(
+                f"Source file was not found: {CSV_PATH}"
+            )
+
+        file_size = CSV_PATH.stat().st_size
+
+        if file_size == 0:
+            raise ValueError(
+                f"Source file exists but is empty: {CSV_PATH}"
+            )
+
+        result = {
+            "file_path": str(CSV_PATH),
+            "file_name": CSV_PATH.name,
+            "file_size_bytes": file_size,
+            "status": "Source file validation successful",
+        }
+
+        print(result)
+        return result
+
+    @task
+    def extract_and_validate_csv(file_info: dict) -> dict:
+        import pandas as pd
+
+        file_path = file_info["file_path"]
+
+        df = pd.read_csv(file_path)
+
+        required_columns = {
+            "order_id",
+            "order_date",
+            "product_id",
+            "product_category",
+            "price",
+            "discount_percent",
+            "quantity_sold",
+            "customer_region",
+            "payment_method",
+            "rating",
+            "review_count",
+            "discounted_price",
+            "total_revenue",
+            "profit",
+        }
+
+        missing_columns = required_columns - set(df.columns)
+
+        if missing_columns:
+            raise ValueError(
+                f"Missing required columns: {sorted(missing_columns)}"
+            )
+
+        if df.empty:
+            raise ValueError("The CSV contains no data rows.")
+
+        result = {
+            "file_path": file_path,
+            "row_count": len(df),
+            "column_count": len(df.columns),
+            "columns": df.columns.tolist(),
+            "status": "CSV extraction and schema validation successful",
+        }
+
+        print(result)
+        return result
+
+
+    @task
+    def clean_and_transform_data(csv_info: dict) -> dict:
+        from pathlib import Path
+
+        import pandas as pd
+
+        file_path = csv_info["file_path"]
+
+        processed_path = Path(
+            "/opt/airflow/data/processed/amazon_sales_cleaned.csv"
+        )
+        rejected_path = Path(
+            "/opt/airflow/data/rejected/amazon_sales_rejected.csv"
+        )
+
+        df = pd.read_csv(file_path)
+
+        original_row_count = len(df)
+
+        # Convert date column
+        df["order_date"] = pd.to_datetime(
+            df["order_date"],
+            errors="coerce"
+        )
+
+        # Convert numeric columns
+        numeric_columns = [
+            "order_id",
+            "product_id",
+            "price",
+            "discount_percent",
+            "quantity_sold",
+            "rating",
+            "review_count",
+            "discounted_price",
+            "total_revenue",
+            "profit",
+        ]
+
+        for column in numeric_columns:
+            df[column] = pd.to_numeric(
+                df[column],
+                errors="coerce"
+            )
+
+        # Standardize text columns
+        text_columns = [
+            "product_category",
+            "customer_region",
+            "payment_method",
+        ]
+
+        for column in text_columns:
+            df[column] = (
+                df[column]
+                .astype("string")
+                .str.strip()
+                .str.title()
+            )
+
+        # Mark invalid records
+        invalid_mask = (
+            df["order_id"].isna()
+            | df["order_date"].isna()
+            | df["product_id"].isna()
+            | df["price"].lt(0)
+            | ~df["discount_percent"].between(0, 100)
+            | df["quantity_sold"].le(0)
+            | ~df["rating"].between(0, 5)
+            | df["review_count"].lt(0)
+            | df["discounted_price"].lt(0)
+            | df["total_revenue"].lt(0)
+        )
+
+        rejected_df = df[invalid_mask].copy()
+        valid_df = df[~invalid_mask].copy()
+
+        # Remove duplicate order IDs from valid records
+        duplicate_mask = valid_df.duplicated(
+            subset=["order_id"],
+            keep="first"
+        )
+
+        duplicate_df = valid_df[duplicate_mask].copy()
+        valid_df = valid_df[~duplicate_mask].copy()
+
+        rejected_df = pd.concat(
+            [rejected_df, duplicate_df],
+            ignore_index=True
+        )
+
+        # Create additional analytics columns
+        valid_df["order_year"] = valid_df["order_date"].dt.year
+        valid_df["order_month"] = valid_df["order_date"].dt.month
+        valid_df["month_name"] = valid_df["order_date"].dt.month_name()
+        valid_df["order_quarter"] = valid_df["order_date"].dt.quarter
+        valid_df["weekday_name"] = valid_df["order_date"].dt.day_name()
+
+        valid_df["discount_group"] = pd.cut(
+            valid_df["discount_percent"],
+            bins=[-0.01, 0, 10, 20, 100],
+            labels=[
+                "No Discount",
+                "Low Discount",
+                "Medium Discount",
+                "High Discount",
+            ],
+            include_lowest=True,
+        )
+
+        valid_df["profit_margin_percent"] = (
+            valid_df["profit"]
+            / valid_df["total_revenue"].replace(0, pd.NA)
+            * 100
+        ).round(2)
+
+        processed_path.parent.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+        rejected_path.parent.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        valid_df.to_csv(processed_path, index=False)
+        rejected_df.to_csv(rejected_path, index=False)
+
+        result = {
+            "clean_file_path": str(processed_path),
+            "rejected_file_path": str(rejected_path),
+            "original_row_count": original_row_count,
+            "valid_row_count": len(valid_df),
+            "rejected_row_count": len(rejected_df),
+            "status": "Data cleaning and transformation successful",
+        }
+
+        print(result)
+        return result
+
+    @task
+    def load_staging_table(cleaning_info: dict) -> dict:
+        import pandas as pd
+        from airflow.providers.mysql.hooks.mysql import MySqlHook
+
+        clean_file_path = cleaning_info["clean_file_path"]
+
+        # Read the cleaned CSV created by the previous task
+        df = pd.read_csv(clean_file_path)
+
+        if df.empty:
+            raise ValueError("The cleaned CSV is empty. Nothing can be loaded.")
+
+        # Convert the date column again because CSV files do not preserve DATE types
+        df["order_date"] = pd.to_datetime(
+            df["order_date"],
+            errors="coerce"
+        ).dt.date
+
+        # Convert Pandas missing values into Python None for MySQL NULL
+        df = df.astype(object).where(pd.notna(df), None)
+
+        columns_to_load = [
+            "order_id",
+            "order_date",
+            "product_id",
+            "product_category",
+            "price",
+            "discount_percent",
+            "quantity_sold",
+            "customer_region",
+            "payment_method",
+            "rating",
+            "review_count",
+            "discounted_price",
+            "total_revenue",
+            "profit",
+            "order_year",
+            "order_month",
+            "month_name",
+            "order_quarter",
+            "weekday_name",
+            "discount_group",
+            "profit_margin_percent",
+        ]
+
+        # Confirm that the cleaned file contains every required column
+        missing_columns = set(columns_to_load) - set(df.columns)
+
+        if missing_columns:
+            raise ValueError(
+                f"Cleaned CSV is missing columns: {sorted(missing_columns)}"
+            )
+
+        df = df[columns_to_load]
+
+        insert_sql = """
+            INSERT INTO stg_amazon_sales (
+                order_id,
+                order_date,
+                product_id,
+                product_category,
+                price,
+                discount_percent,
+                quantity_sold,
+                customer_region,
+                payment_method,
+                rating,
+                review_count,
+                discounted_price,
+                total_revenue,
+                profit,
+                order_year,
+                order_month,
+                month_name,
+                order_quarter,
+                weekday_name,
+                discount_group,
+                profit_margin_percent
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s
+            )
+        """
+
+        mysql_hook = MySqlHook(
+            mysql_conn_id="mysql_amazon_sales"
+        )
+
+        connection = mysql_hook.get_conn()
+        cursor = connection.cursor()
+
+        try:
+            # Full refresh: remove data from the previous pipeline run
+            cursor.execute("TRUNCATE TABLE stg_amazon_sales")
+
+            batch_size = 1000
+            total_loaded = 0
+
+            for start_index in range(0, len(df), batch_size):
+                batch_df = df.iloc[
+                    start_index:start_index + batch_size
+                ]
+
+                records = list(
+                    batch_df.itertuples(index=False, name=None)
+                )
+
+                cursor.executemany(insert_sql, records)
+                total_loaded += len(records)
+
+            connection.commit()
+
+            # Verify how many rows now exist in the staging table
+            cursor.execute(
+                "SELECT COUNT(*) FROM stg_amazon_sales"
+            )
+            staging_row_count = cursor.fetchone()[0]
+
+            if staging_row_count != len(df):
+                raise ValueError(
+                    "Staging-table row count does not match the cleaned file. "
+                    f"Expected {len(df)}, found {staging_row_count}."
+                )
+
+            result = {
+                "source_clean_rows": len(df),
+                "rows_loaded": total_loaded,
+                "staging_row_count": staging_row_count,
+                "table_name": "stg_amazon_sales",
+                "status": "Staging-table load successful",
+            }
+
+            print(result)
+            return result
+
+        except Exception:
+            connection.rollback()
+            raise
+
+        finally:
+            cursor.close()
+            connection.close()
+    @task
+    def validate_staging_data(staging_info: dict) -> dict:
+        from airflow.providers.mysql.hooks.mysql import MySqlHook
+
+        mysql_hook = MySqlHook(
+            mysql_conn_id="mysql_amazon_sales"
+        )
+
+        expected_rows = staging_info["staging_row_count"]
+
+        validation_sql = """
+            SELECT
+                COUNT(*) AS total_rows,
+
+                SUM(
+                    CASE
+                        WHEN order_id IS NULL THEN 1
+                        ELSE 0
+                    END
+                ) AS missing_order_ids,
+
+                COUNT(*) - COUNT(DISTINCT order_id)
+                    AS duplicate_order_ids,
+
+                SUM(
+                    CASE
+                        WHEN order_date IS NULL THEN 1
+                        ELSE 0
+                    END
+                ) AS missing_order_dates,
+
+                SUM(
+                    CASE
+                        WHEN product_id IS NULL THEN 1
+                        ELSE 0
+                    END
+                ) AS missing_product_ids,
+
+                SUM(
+                    CASE
+                        WHEN discount_percent < 0
+                        OR discount_percent > 100
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS invalid_discounts,
+
+                SUM(
+                    CASE
+                        WHEN rating < 0
+                        OR rating > 5
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS invalid_ratings,
+
+                SUM(
+                    CASE
+                        WHEN price < 0
+                        OR discounted_price < 0
+                        OR total_revenue < 0
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS invalid_financial_values,
+
+                SUM(
+                    CASE
+                        WHEN quantity_sold <= 0
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS invalid_quantities
+
+            FROM stg_amazon_sales
+        """
+
+        result = mysql_hook.get_first(validation_sql)
+
+        (
+            total_rows,
+            missing_order_ids,
+            duplicate_order_ids,
+            missing_order_dates,
+            missing_product_ids,
+            invalid_discounts,
+            invalid_ratings,
+            invalid_financial_values,
+            invalid_quantities,
+        ) = result
+
+        failures = []
+
+        if total_rows == 0:
+            failures.append("The staging table is empty.")
+
+        if total_rows != expected_rows:
+            failures.append(
+                f"Expected {expected_rows} rows, but found {total_rows}."
+            )
+
+        if missing_order_ids > 0:
+            failures.append(
+                f"{missing_order_ids} rows have missing order IDs."
+            )
+
+        if duplicate_order_ids > 0:
+            failures.append(
+                f"{duplicate_order_ids} duplicate order IDs were found."
+            )
+
+        if missing_order_dates > 0:
+            failures.append(
+                f"{missing_order_dates} rows have missing order dates."
+            )
+
+        if missing_product_ids > 0:
+            failures.append(
+                f"{missing_product_ids} rows have missing product IDs."
+            )
+
+        if invalid_discounts > 0:
+            failures.append(
+                f"{invalid_discounts} invalid discount values were found."
+            )
+
+        if invalid_ratings > 0:
+            failures.append(
+                f"{invalid_ratings} invalid rating values were found."
+            )
+
+        if invalid_financial_values > 0:
+            failures.append(
+                f"{invalid_financial_values} invalid financial values "
+                "were found."
+            )
+
+        if invalid_quantities > 0:
+            failures.append(
+                f"{invalid_quantities} invalid quantity values were found."
+            )
+
+        if failures:
+            raise ValueError(
+                "Staging data validation failed: "
+                + " ".join(failures)
+            )
+
+        validation_result = {
+            "table_name": "stg_amazon_sales",
+            "total_rows": total_rows,
+            "missing_order_ids": missing_order_ids,
+            "duplicate_order_ids": duplicate_order_ids,
+            "missing_order_dates": missing_order_dates,
+            "missing_product_ids": missing_product_ids,
+            "invalid_discounts": invalid_discounts,
+            "invalid_ratings": invalid_ratings,
+            "invalid_financial_values": invalid_financial_values,
+            "invalid_quantities": invalid_quantities,
+            "status": "Staging data-quality validation passed",
+        }
+
+        print(validation_result)
+        return validation_result
+    @task
+    def load_fact_table(validation_info: dict) -> dict:
+        from airflow.providers.mysql.hooks.mysql import MySqlHook
+
+        mysql_hook = MySqlHook(
+            mysql_conn_id="mysql_amazon_sales"
+        )
+
+        expected_rows = validation_info["total_rows"]
+
+        connection = mysql_hook.get_conn()
+        cursor = connection.cursor()
+
+        try:
+            cursor.execute("TRUNCATE TABLE fact_amazon_sales")
+
+            insert_sql = """
+                INSERT INTO fact_amazon_sales (
+                    order_id,
+                    order_date,
+                    product_id,
+                    product_category,
+                    price,
+                    discount_percent,
+                    quantity_sold,
+                    customer_region,
+                    payment_method,
+                    rating,
+                    review_count,
+                    discounted_price,
+                    total_revenue,
+                    profit,
+                    order_year,
+                    order_month,
+                    month_name,
+                    order_quarter,
+                    weekday_name,
+                    discount_group,
+                    profit_margin_percent
+                )
+                SELECT
+                    order_id,
+                    order_date,
+                    product_id,
+                    product_category,
+                    price,
+                    discount_percent,
+                    quantity_sold,
+                    customer_region,
+                    payment_method,
+                    rating,
+                    review_count,
+                    discounted_price,
+                    total_revenue,
+                    profit,
+                    order_year,
+                    order_month,
+                    month_name,
+                    order_quarter,
+                    weekday_name,
+                    discount_group,
+                    profit_margin_percent
+                FROM stg_amazon_sales
+            """
+
+            cursor.execute(insert_sql)
+            connection.commit()
+
+            cursor.execute(
+                "SELECT COUNT(*) FROM fact_amazon_sales"
+            )
+            fact_row_count = cursor.fetchone()[0]
+
+            if fact_row_count != expected_rows:
+                raise ValueError(
+                    "Fact-table row count mismatch. "
+                    f"Expected {expected_rows}, found {fact_row_count}."
+                )
+
+            result = {
+                "table_name": "fact_amazon_sales",
+                "expected_rows": expected_rows,
+                "loaded_rows": fact_row_count,
+                "status": "Fact-table load successful",
+            }
+
+            print(result)
+            return result
+
+        except Exception:
+            connection.rollback()
+            raise
+
+        finally:
+            cursor.close()
+            connection.close()
+    @task
+    def create_analytics_views(fact_info: dict) -> dict:
+        from airflow.providers.mysql.hooks.mysql import MySqlHook
+
+        mysql_hook = MySqlHook(
+            mysql_conn_id="mysql_amazon_sales"
+        )
+
+        expected_rows = fact_info["loaded_rows"]
+
+        if expected_rows <= 0:
+            raise ValueError(
+                "The fact table contains no data. "
+                "Analytics views cannot be created."
+            )
+
+        view_queries = {
+            "vw_monthly_performance": """
+                CREATE OR REPLACE VIEW vw_monthly_performance AS
+                SELECT
+                    YEAR(order_date) AS sales_year,
+                    MONTH(order_date) AS sales_month_number,
+                    DATE_FORMAT(order_date, '%Y-%m') AS sales_month,
+                    MONTHNAME(order_date) AS month_name,
+                    COUNT(DISTINCT order_id) AS total_orders,
+                    SUM(quantity_sold) AS total_units_sold,
+                    ROUND(SUM(total_revenue), 2) AS total_revenue,
+                    ROUND(SUM(profit), 2) AS total_profit,
+                    ROUND(
+                        SUM(total_revenue)
+                        / NULLIF(COUNT(DISTINCT order_id), 0),
+                        2
+                    ) AS average_order_value,
+                    ROUND(
+                        SUM(profit)
+                        / NULLIF(SUM(total_revenue), 0) * 100,
+                        2
+                    ) AS profit_margin_percent
+                FROM fact_amazon_sales
+                GROUP BY
+                    YEAR(order_date),
+                    MONTH(order_date),
+                    DATE_FORMAT(order_date, '%Y-%m'),
+                    MONTHNAME(order_date)
+            """,
+
+            "vw_category_performance": """
+                CREATE OR REPLACE VIEW vw_category_performance AS
+                SELECT
+                    product_category,
+                    COUNT(DISTINCT order_id) AS total_orders,
+                    COUNT(DISTINCT product_id) AS distinct_products,
+                    SUM(quantity_sold) AS total_units_sold,
+                    ROUND(SUM(total_revenue), 2) AS total_revenue,
+                    ROUND(SUM(profit), 2) AS total_profit,
+                    ROUND(AVG(rating), 2) AS average_rating,
+                    SUM(review_count) AS total_reviews,
+                    ROUND(
+                        SUM(profit)
+                        / NULLIF(SUM(total_revenue), 0) * 100,
+                        2
+                    ) AS profit_margin_percent
+                FROM fact_amazon_sales
+                GROUP BY product_category
+            """,
+
+            "vw_region_performance": """
+                CREATE OR REPLACE VIEW vw_region_performance AS
+                SELECT
+                    customer_region,
+                    COUNT(DISTINCT order_id) AS total_orders,
+                    SUM(quantity_sold) AS total_units_sold,
+                    ROUND(SUM(total_revenue), 2) AS total_revenue,
+                    ROUND(SUM(profit), 2) AS total_profit,
+                    ROUND(AVG(rating), 2) AS average_rating,
+                    ROUND(
+                        SUM(total_revenue)
+                        / NULLIF(COUNT(DISTINCT order_id), 0),
+                        2
+                    ) AS average_order_value,
+                    ROUND(
+                        SUM(profit)
+                        / NULLIF(SUM(total_revenue), 0) * 100,
+                        2
+                    ) AS profit_margin_percent
+                FROM fact_amazon_sales
+                GROUP BY customer_region
+            """,
+
+            
+
+            "vw_discount_impact": """
+                CREATE OR REPLACE VIEW vw_discount_impact AS
+                SELECT
+                    discount_group,
+                    COUNT(DISTINCT order_id) AS total_orders,
+                    SUM(quantity_sold) AS total_units_sold,
+                    ROUND(AVG(discount_percent), 2)
+                        AS average_discount_percent,
+                    ROUND(SUM(total_revenue), 2) AS total_revenue,
+                    ROUND(SUM(profit), 2) AS total_profit,
+                    ROUND(
+                        SUM(total_revenue)
+                        / NULLIF(COUNT(DISTINCT order_id), 0),
+                        2
+                    ) AS average_revenue_per_order,
+                    ROUND(
+                        SUM(profit)
+                        / NULLIF(COUNT(DISTINCT order_id), 0),
+                        2
+                    ) AS average_profit_per_order,   
+                    ROUND(
+                        SUM(profit)
+                        / NULLIF(SUM(total_revenue), 0) * 100,
+                        2
+                    ) AS profit_margin_percent
+                FROM fact_amazon_sales
+                GROUP BY discount_group
+            """,
+        }
+
+        created_views = []
+
+        for view_name, query in view_queries.items():
+            mysql_hook.run(
+                sql=query,
+                autocommit=True
+            )
+
+            created_views.append(view_name)
+            print(f"Created or updated view: {view_name}")
+
+        result = {
+            "fact_table_rows": expected_rows,
+            "views_created": created_views,
+            "view_count": len(created_views),
+            "status": "Analytics views created successfully",
+        }
+
+        print(result)
+        return result
+    
+    @task
+    def calculate_insight_metrics(views_info: dict):
+
+        mysql_hook = MySqlHook(
+            mysql_conn_id="mysql_amazon_sales"
+        )
+
+        overall_sql = """
+            SELECT
+                COUNT(DISTINCT order_id) AS total_orders,
+                ROUND(SUM(total_revenue), 2) AS total_revenue,
+                ROUND(SUM(profit), 2) AS total_profit,
+                SUM(quantity_sold) AS total_units_sold,
+                ROUND(AVG(rating), 2) AS average_rating,
+                MIN(order_date) AS analysis_start_date,
+                MAX(order_date) AS analysis_end_date
+            FROM fact_amazon_sales;
+        """
+        overall_result = mysql_hook.get_first(overall_sql)
+        
+
+        overall_metrics = {
+            "total_orders": int(overall_result[0]),
+            "total_revenue": float(overall_result[1]),
+            "total_profit": float(overall_result[2]),
+            "total_units_sold": int(overall_result[3]),
+            "average_rating": float(overall_result[4]),
+            "analysis_start_date": str(overall_result[5]),
+            "analysis_end_date": str(overall_result[6])
+
+        
+        }
+        
+        
+        category_sql = """
+            SELECT
+                product_category,
+                ROUND(SUM(total_revenue), 2) AS revenue,
+                ROUND(SUM(profit), 2) AS profit,
+                SUM(quantity_sold) AS units_sold,
+                ROUND(AVG(rating), 2) AS average_rating,
+                SUM(review_count) AS total_reviews
+            FROM fact_amazon_sales
+            GROUP BY product_category
+            ORDER BY revenue DESC;
+        """
+        category_rows = mysql_hook.get_records(category_sql)
+
+        category_metrics = []
+
+        for row in category_rows:
+            category_metrics.append({
+                "category": row[0],
+                "revenue": float(row[1]),
+                "profit": float(row[2]),
+                "units_sold": int(row[3]),
+                "average_rating": float(row[4]),
+                "total_reviews": int(row[5])
+            })
+       
+        region_sql = """
+                SELECT
+                    customer_region,
+                    ROUND(SUM(total_revenue), 2) AS revenue,
+                    ROUND(SUM(profit), 2) AS profit,
+                    COUNT(DISTINCT order_id) AS orders,
+                    SUM(quantity_sold) AS units_sold,
+                    ROUND(AVG(rating), 2) AS average_rating
+                FROM fact_amazon_sales
+                GROUP BY customer_region
+                ORDER BY revenue DESC;
+            """
+
+        region_rows = mysql_hook.get_records(region_sql)
+
+        region_metrics = []
+
+        for row in region_rows:
+            region_metrics.append({
+                "region": row[0],
+                "revenue": float(row[1]),
+                "profit": float(row[2]),
+                "orders": int(row[3]),
+                "units_sold": int(row[4]),
+                "average_rating": float(row[5])
+            })
+
+        monthly_sql = """
+                SELECT
+                    YEAR(order_date) AS year,
+                    MONTH(order_date) AS month,
+                    ROUND(SUM(total_revenue), 2) AS revenue,
+                    ROUND(SUM(profit), 2) AS profit,
+                    COUNT(DISTINCT order_id) AS orders,
+                    SUM(quantity_sold) AS units_sold
+                FROM fact_amazon_sales
+                GROUP BY
+                    YEAR(order_date),
+                    MONTH(order_date)
+                ORDER BY
+                    YEAR(order_date),
+                    MONTH(order_date);
+            """
+        monthly_rows = mysql_hook.get_records(monthly_sql)
+
+        monthly_metrics = []
+
+        for row in monthly_rows:
+            monthly_metrics.append({
+                "year": int(row[0]),
+                "month": int(row[1]),
+                "revenue": float(row[2]),
+                "profit": float(row[3]),
+                "orders": int(row[4]),
+                "units_sold": int(row[5])
+            })
+
+        discount_sql = """
+            
+                SELECT
+                    discount_group,
+                    ROUND(SUM(total_revenue), 2) AS revenue,
+                    SUM(quantity_sold) AS units_sold,
+                    COUNT(DISTINCT order_id) AS orders,
+                    ROUND(AVG(rating), 2) AS average_rating
+
+                FROM (
+                    SELECT
+                        order_id,
+                        total_revenue,
+                        quantity_sold,
+                        rating,
+
+                        CASE
+                            WHEN discount_percent = 0 THEN 'No Discount'
+                            WHEN discount_percent <= 10 THEN '1-10%'
+                            WHEN discount_percent <= 20 THEN '11-20%'
+                            WHEN discount_percent <= 30 THEN '21-30%'
+                            ELSE '31%+'
+                        END AS discount_group
+
+                    FROM fact_amazon_sales
+                ) AS discount_data
+
+                GROUP BY discount_group
+                ORDER BY revenue DESC;
+            """
+
+        discount_rows = mysql_hook.get_records(discount_sql)
+
+        discount_metrics = []
+
+        for row in discount_rows:
+            discount_metrics.append({
+                "discount_group": row[0],
+                "revenue": float(row[1]),
+                "units_sold": int(row[2]),
+                "orders": int(row[3]),
+                "average_rating": float(row[4])
+                })
+    
+        metrics = {
+                    "overall": overall_metrics,
+                    "categories": category_metrics,
+                    "regions": region_metrics,
+                    "monthly_performance": monthly_metrics,
+                    "discount_performance": discount_metrics
+                }        
+        
+
+        return metrics
+
+    @task
+    def detect_business_patterns(metrics: dict):
+
+        categories = metrics["categories"]
+        regions = metrics["regions"]
+        monthly = metrics["monthly_performance"]
+        discounts = metrics["discount_performance"]
+
+    
+        # 1. CATEGORY PATTERNS
+        top_category = max(
+            categories,
+            key=lambda x: x["revenue"]
+        )
+
+        lowest_category = min(
+            categories,
+            key=lambda x: x["revenue"]
+        )
+
+        highest_rated_category = max(
+            categories,
+            key=lambda x: x["average_rating"]
+        )
+
+        lowest_rated_category = min(
+            categories,
+            key=lambda x: x["average_rating"]
+        )
+
+    
+        # 2. REGION PATTERNS
+        top_region = max(
+            regions,
+            key=lambda x: x["revenue"]
+        )
+
+        lowest_region = min(
+            regions,
+            key=lambda x: x["revenue"]
+        )
+
+        highest_rated_region = max(
+            regions,
+            key=lambda x: x["average_rating"]
+        )
+
+        lowest_rated_region = min(
+            regions,
+            key=lambda x: x["average_rating"]
+        )
+
+    
+        # 3. MONTHLY PATTERNS
+        best_month = max(
+            monthly,
+            key=lambda x: x["revenue"]
+        )
+
+        worst_month = min(
+            monthly,
+            key=lambda x: x["revenue"]
+        )
+
+        monthly_growth = []
+
+        for i in range(1, len(monthly)):
+
+            previous_month = monthly[i - 1]
+            current_month = monthly[i]
+
+            previous_revenue = previous_month["revenue"]
+            current_revenue = current_month["revenue"]
+
+            if previous_revenue != 0:
+
+                growth_percent = (
+                    (current_revenue - previous_revenue)
+                    / previous_revenue
+                ) * 100
+
+                monthly_growth.append({
+                    "from_year": previous_month["year"],
+                    "from_month": previous_month["month"],
+                    "to_year": current_month["year"],
+                    "to_month": current_month["month"],
+                    "growth_percent": round(growth_percent, 2)
+                })
+
+        largest_monthly_growth = max(
+            monthly_growth,
+            key=lambda x: x["growth_percent"]
+        )
+
+        largest_monthly_decline = min(
+            monthly_growth,
+            key=lambda x: x["growth_percent"]
+        )
+
+        
+        # 4. DISCOUNT PATTERNS
+        top_discount_group = max(
+            discounts,
+            key=lambda x: x["revenue"]
+        )
+
+        lowest_discount_group = min(
+            discounts,
+            key=lambda x: x["revenue"]
+        )
+
+        highest_units_discount_group = max(
+            discounts,
+            key=lambda x: x["units_sold"]
+        )
+
+        
+        # 5. CATEGORY REVENUE CONCENTRATION
+        total_category_revenue = sum(
+            category["revenue"]
+            for category in categories
+        )
+
+        top_category_revenue_share = (
+            top_category["revenue"]
+            / total_category_revenue
+        ) * 100
+
+        
+        # 6. FINAL BUSINESS PATTERNS
+        patterns = {
+
+            "category_patterns": {
+                "top_revenue_category": top_category,
+                "lowest_revenue_category": lowest_category,
+                "highest_rated_category": highest_rated_category,
+                "lowest_rated_category": lowest_rated_category,
+                "top_category_revenue_share_percent":
+                    round(top_category_revenue_share, 2)
+            },
+
+            "regional_patterns": {
+                "top_revenue_region": top_region,
+                "lowest_revenue_region": lowest_region,
+                "highest_rated_region": highest_rated_region,
+                "lowest_rated_region": lowest_rated_region
+            },
+
+            "monthly_patterns": {
+                "best_revenue_month": best_month,
+                "worst_revenue_month": worst_month,
+                "largest_monthly_growth": largest_monthly_growth,
+                "largest_monthly_decline": largest_monthly_decline
+            },
+
+            "discount_patterns": {
+                "top_revenue_discount_group": top_discount_group,
+                "lowest_revenue_discount_group": lowest_discount_group,
+                "highest_units_discount_group":
+                    highest_units_discount_group
+            }
+        }
+
+        print("Detected Business Patterns:")
+        print(patterns)
+
+        return patterns
+
+    @task
+    def build_llm_context(metrics: dict, patterns: dict):
+
+        overall = metrics["overall"]
+        categories = metrics["categories"]
+        regions = metrics["regions"]
+        monthly = metrics["monthly_performance"]
+        discounts = metrics["discount_performance"]
+
+        llm_context = {
+
+            "analysis_period": {
+                "start_date": overall["analysis_start_date"],
+                "end_date": overall["analysis_end_date"]
+            },
+
+            "overall_performance": {
+                "total_orders": overall["total_orders"],
+                "total_revenue": overall["total_revenue"],
+                "total_profit": overall["total_profit"],
+                "total_units_sold": overall["total_units_sold"],
+                "average_rating": overall["average_rating"]
+            },
+
+            "category_performance": categories,
+
+            "regional_performance": regions,
+
+            "monthly_performance": monthly,
+
+            "discount_performance": discounts,
+
+            "detected_business_patterns": patterns
+        }
+
+        print("LLM Context:")
+        print(llm_context)
+
+        return llm_context
+
+    @task
+    def generate_ai_insights(llm_context: dict):
+
+        client = OpenAI()
+
+        prompt = f"""
+    You are a business analytics assistant analyzing Amazon sales performance.
+
+    Use ONLY the supplied data.
+
+    Generate executive-level sales insights for a Power BI dashboard.
+
+        IMPORTANT:
+        Keep the output concise, analytical, and decision-focused.
+
+        Requirements:
+
+        executive_summary:
+        - Maximum 70 words
+        - Maximum 3 sentences , Justify the content format
+        - Mention only the most important business metrics
+        - Do not repeat unnecessary numbers
+        - Focus on overall performance, major change, and business implication
+
+        trend_analysis:
+        - Maximum 70 words
+        - Maximum 3 sentences
+        - Identify the most important trend
+        - Mention only significant changes or anomalies
+
+        key_findings:
+        - Maximum 4 findings
+        - Each finding must be 20 words or fewer
+        - Avoid repeating information from the executive summary
+
+        recommendations:
+        - Maximum 4 major recommendations
+        - Each recommendation must be 10 words or fewer
+        - Recommendations must be specific and actionable with Evidence-based justification
+        - Prioritize actions with the highest likely business impact
+
+        risks:
+        - Maximum 3 items
+        - Each item must be 10 words or fewer
+
+        opportunities:
+        - Maximum 3 items
+        - Each item must be 15 words or fewer
+
+        regional_insights:
+        - Maximum 3 Major insights
+        - Each insight must be 15 words or fewer
+        - Focus on regions with significant performance differences and give actionable recommendations also.
+
+        
+
+    Rules:
+    - Do not invent numerical values.
+    - Do not use outside information.
+    - Do not claim causation unless supported by the data.
+    - Do not include unnecessary explanations.
+    - Do not repeat the same insight across multiple fields.
+    - Do not include every available metric.
+    - Prioritize insights that would matter to a sales executive.
+    - Treat detected business patterns as verified analytical findings.
+    - Focus on business interpretation and actionable recommendations.
+    - Keep the response concise and professional.
+
+    Return ONLY valid JSON with this structure:
+
+    {{
+        "executive_summary": "string",
+        "key_findings": ["string"],
+        "trend_analysis": "string",
+        "category_insights": ["string"],
+        "regional_insights": ["string"],
+        "discount_insights": ["string"],
+        "customer_feedback_insights": ["string"],
+        "risks": ["string"],
+        "opportunities": ["string"],
+        "recommendations": ["string"],
+        "follow_up_questions": ["string"]
+    }}
+
+    Business data:
+
+    {json.dumps(llm_context, indent=2, default=str)}
+    """
+
+        response = client.responses.create(
+            model="gpt-5.6-luna",
+            input=prompt
+        )
+
+        ai_text = response.output_text
+
+        print("Raw AI Response:")
+        print(ai_text)
+
+        ai_insights = json.loads(ai_text)
+
+        return ai_insights
+
+    @task
+    def validate_ai_insights(ai_insights: dict):
+
+        required_fields = {
+            "executive_summary": str,
+            "key_findings": list,
+            "trend_analysis": str,
+            "category_insights": list,
+            "regional_insights": list,
+            "discount_insights": list,
+            "customer_feedback_insights": list,
+            "risks": list,
+            "opportunities": list,
+            "recommendations": list,
+            "follow_up_questions": list
+        }
+
+       
+        # 1. Validate response type
+        
+        if not isinstance(ai_insights, dict):
+            raise ValueError(
+                "AI insights must be returned as a dictionary."
+            )
+
+        
+        # 2. Validate required fields
+        
+        for field, expected_type in required_fields.items():
+
+            if field not in ai_insights:
+                raise ValueError(
+                    f"Missing required AI insight field: {field}"
+                )
+
+            if not isinstance(ai_insights[field], expected_type):
+                raise ValueError(
+                    f"Field '{field}' must be of type "
+                    f"{expected_type.__name__}."
+                )
+
+        
+        # 3. Validate important text fields
+        
+        if not ai_insights["executive_summary"].strip():
+            raise ValueError(
+                "Executive summary cannot be empty."
+            )
+
+        if not ai_insights["trend_analysis"].strip():
+            raise ValueError(
+                "Trend analysis cannot be empty."
+            )
+
+        
+        # 4. Validate list fields
+       
+        list_fields = [
+            "key_findings",
+            "category_insights",
+            "regional_insights",
+            "discount_insights",
+            "customer_feedback_insights",
+            "risks",
+            "opportunities",
+            "recommendations",
+            "follow_up_questions"
+        ]
+
+        for field in list_fields:
+
+            if len(ai_insights[field]) == 0:
+                raise ValueError(
+                    f"Field '{field}' cannot be empty."
+                )
+
+            for item in ai_insights[field]:
+
+                if not isinstance(item, str):
+                    raise ValueError(
+                        f"All items in '{field}' must be strings."
+                    )
+
+                if not item.strip():
+                    raise ValueError(
+                        f"Field '{field}' contains an empty string."
+                    )
+
+        print("AI insights validation successful.")
+
+        return ai_insights
+
+    def format_list_for_bi(value):
+    
+
+        if value is None:
+            return None
+
+        if not isinstance(value, list):
+            return value
+
+        return "\n".join(
+            f"• {str(item).strip()}"
+            for item in value
+            if item is not None and str(item).strip()
+        )
+
+    
+    def format_ai_insights_for_bi(insights):
+   
+
+        list_fields = [
+        "key_findings",
+        "category_insights",
+        "regional_insights",
+        "discount_insights",
+        "customer_feedback_insights",
+        "anomaly_explanations",
+        "risks",
+        "opportunities",
+        "recommendations",
+        "follow_up_questions"
+        ]
+
+        formatted = insights.copy()
+
+        for field in list_fields:
+            if field in formatted:
+                formatted[field] = format_list_for_bi(
+                    formatted[field]
+                )
+
+        return formatted
+
+    @task
+    def store_ai_insights(
+        validated_insights: dict,
+        llm_context: dict
+    ):
+
+        # Convert list fields into Power BI-friendly text
+        formatted_insights = format_ai_insights_for_bi(
+            validated_insights
+        )
+
+        mysql_hook = MySqlHook(
+            mysql_conn_id="mysql_amazon_sales"
+        )
+
+        database_name = mysql_hook.get_first("SELECT DATABASE();")
+
+        print(f"Connected MySQL database: {database_name[0]}")
+
+        context = get_current_context()
+
+        airflow_run_id = context["run_id"]
+
+        overall = llm_context["overall_performance"]
+        analysis_period = llm_context["analysis_period"]
+
+        insert_sql = """
+            INSERT INTO ai_sales_insights (
+                analysis_start_date,
+                analysis_end_date,
+
+                total_orders,
+                total_revenue,
+                total_profit,
+                total_units_sold,
+                average_rating,
+
+                executive_summary,
+                key_findings,
+                trend_analysis,
+                category_insights,
+                regional_insights,
+                discount_insights,
+                customer_feedback_insights,
+
+                risks,
+                opportunities,
+                recommendations,
+                follow_up_questions,
+
+                model_name,
+                airflow_run_id
+            )
+            VALUES (
+                %s, %s,
+                %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s
+            )
+        """
+
+        parameters = (
+            analysis_period["start_date"],
+            analysis_period["end_date"],
+
+            overall["total_orders"],
+            overall["total_revenue"],
+            overall["total_profit"],
+            overall["total_units_sold"],
+            overall["average_rating"],
+
+            validated_insights["executive_summary"],
+            formatted_insights["key_findings"],
+            validated_insights["trend_analysis"],
+            formatted_insights["category_insights"],
+            formatted_insights["regional_insights"],
+            formatted_insights["discount_insights"],
+            formatted_insights["customer_feedback_insights"],
+            formatted_insights["risks"],
+            formatted_insights["opportunities"],
+            formatted_insights["recommendations"],
+            formatted_insights["follow_up_questions"],
+
+            "gpt-5.6-luna",
+            airflow_run_id
+            )
+
+        mysql_hook.run(
+            insert_sql,
+            parameters=parameters
+        )
+
+        print(
+            f"AI insights stored successfully "
+            f"for Airflow run: {airflow_run_id}"
+        )
+
+        return {
+            "status": "success",
+            "airflow_run_id": airflow_run_id
+        }
+
+    file_info = check_source_file()
+    csv_info = extract_and_validate_csv(file_info)
+    cleaning_info = clean_and_transform_data(csv_info)
+    staging_info = load_staging_table(cleaning_info)
+    validation_info = validate_staging_data(staging_info)
+    fact_info = load_fact_table(validation_info)
+    views_info = create_analytics_views(fact_info)
+    insight_metrics = calculate_insight_metrics(views_info)
+    business_patterns = detect_business_patterns(insight_metrics)
+    llm_context = build_llm_context( insight_metrics, business_patterns)
+    ai_insights = generate_ai_insights( llm_context )
+    validated_ai_insights = validate_ai_insights(ai_insights)
+    stored_ai_insights = store_ai_insights( validated_ai_insights, llm_context )
+
+    
+    
+
+
+amazon_sales_etl_pipeline()
