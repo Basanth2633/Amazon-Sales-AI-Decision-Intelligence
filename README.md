@@ -3,5 +3,6 @@ The project automates the process of converting raw sales data into trustworthy 
 
 Technologies: Apache Airflow, Python, Pandas, SQL, MySQL, Power BI, DAX, Docker, OpenAI API, GPT-5.6 Luna, Git/GitHub.
 
+<h1>Architecture:</h1>
 <img width="1672" height="941" alt="Architecture" src="https://github.com/user-attachments/assets/add08167-7dac-481d-9514-a82afc834fc4" />
 
