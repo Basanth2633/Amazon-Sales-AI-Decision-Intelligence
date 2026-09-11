@@ -1,1 +1,5 @@
-# Amazon-Sales-AI-Decision-Intelligence
+This project is about building an end-to-end sales analytics and AI decision-support system that turns raw Amazon sales data into reliable business insights automatically.
+
+The workflow starts with raw sales data, which is processed through an Apache Airflow ETL pipeline using Python, SQL, and MySQL. The pipeline validates, cleans, transforms, and loads the data into staging and fact tables, then creates reusable SQL views for monthly, category, regional, and discount analysis. Power BI uses this prepared data to provide interactive dashboards for sales performance and business reporting.
+
+The project then adds an LLM-powered intelligence layer using the OpenAI API. Instead of sending all raw records directly to the model, Python and SQL first calculate verified KPIs and detect important business patterns. These structured metrics are passed to the LLM, which generates executive summaries, key findings, risks, opportunities, recommendations, and follow-up questions. The AI output is validated, stored in MySQL, and displayed in a dedicated AI Sales Intelligence dashboard in Power BI.
